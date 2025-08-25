@@ -1,24 +1,16 @@
 #!/usr/bin/env python3
 """
-Find near-duplicate / highly similar paragraphs in a .docx document.
+Find near-duplicate or highly similar paragraphs in a DOCX document.
 
-New in this version:
+Usage:
+  python main.py --input kk2.docx --threshold 0.9 --topk 5 --html report.html
+
+Key features:
 - Pre-embedding de-duplication with configurable modes (off / exact / normalized)
 - Simple HTML report with inline similarity coloring and diff-like highlighting
-- Same speedups as before: batched embeddings, caching, chunked cosine
+- Batched embeddings, caching and chunked cosine for speed
 
 Dependencies: python-docx, FlagEmbedding, numpy, tqdm
-Optional (HTML diff quality): beautifulsoup4 (only for escaping convenience; we fallback if missing)
-
-Examples:
-  python refactored_similar_paragraphs.py \
-    --input kk2.docx --threshold 0.9 --topk 5 --html report.html
-
-  # strict dedupe of exact duplicates before encoding
-  python refactored_similar_paragraphs.py --input kk2.docx --dedupe exact
-
-  # more aggressive dedupe on whitespace/case/punct normalization
-  python refactored_similar_paragraphs.py --input kk2.docx --dedupe normalized
 """
 from __future__ import annotations
 
