@@ -16,12 +16,28 @@ import subprocess
 import sys
 import threading
 from pathlib import Path
+from typing import Callable
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext
 
 
+def _set_state(widget: tk.Widget, state: str) -> None:
+    """Recursively set ``state`` for ``widget`` and its children."""
+    try:
+        widget.configure(state=state)
+    except tk.TclError:
+        pass
+    for child in widget.winfo_children():
+        _set_state(child, state)
+
+
 def _run_similarity(
-    docx: Path, threshold: float, backend: str, model: str, log: tk.Text
+    docx: Path,
+    threshold: float,
+    backend: str,
+    model: str,
+    log: tk.Text,
+    on_done: Callable[[Path, Path], None],
 ) -> None:
     """Execute :mod:`main` for ``docx`` and append output to ``log``."""
     out_txt = docx.with_suffix(".txt")
@@ -51,9 +67,7 @@ def _run_similarity(
         log.insert(tk.END, line)
         log.see(tk.END)
     proc.wait()
-    messagebox.showinfo(
-        "Готово", f"Отчёты сохранены рядом с документом:\n{out_txt}\n{out_html}"
-    )
+    log.after(0, lambda: on_done(out_txt, out_html))
 
 
 def main() -> None:
@@ -76,6 +90,15 @@ def main() -> None:
             messagebox.showerror("Ошибка", "Выберите DOCX файл")
             return
         log.delete("1.0", tk.END)
+        _set_state(frm, tk.DISABLED)
+
+        def on_done(out_txt: Path, out_html: Path) -> None:
+            _set_state(frm, tk.NORMAL)
+            messagebox.showinfo(
+                "Готово",
+                f"Отчёты сохранены рядом с документом:\n{out_txt}\n{out_html}",
+            )
+
         th = threading.Thread(
             target=_run_similarity,
             args=(
@@ -84,6 +107,7 @@ def main() -> None:
                 backend_var.get(),
                 model_var.get(),
                 log,
+                on_done,
             ),
             daemon=True,
         )
