@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """
-Similar paragraphs finder for .docx files (clean final version).
+Similar paragraphs finder for .docx files.
 
 Features
-- Batched embeddings (FlagEmbedding BGE-M3 by default)
+- Batched embeddings with switchable backend (FlagEmbedding BGE or sentence-transformers)
 - Optional pre-embedding de-duplication: off / exact / normalized
 - Length-based masking for candidate pairs (min ratio and/or max abs diff)
 - Chunked cosine similarities with unique (i<j) pairs
 - TXT / CSV / HTML report (with simple inline highlight of common spans)
-- Embedding cache on disk per (file, mtime, model, min_len, max_length)
+- Embedding cache on disk per (file, mtime, backend, model, min_len, max_length)
 
 Install deps:
-  pip install python-docx FlagEmbedding numpy tqdm
+  pip install python-docx FlagEmbedding sentence-transformers numpy tqdm
 
 Usage examples:
   python similar_paragraphs_final.py \
@@ -28,7 +28,6 @@ import argparse
 import html as _html
 import json
 import re
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -37,11 +36,7 @@ import numpy as np
 from docx import Document
 from tqdm import tqdm
 
-try:
-    from FlagEmbedding import BGEM3FlagModel
-except Exception as e:  # pragma: no cover
-    print("[!] Please `pip install FlagEmbedding` (and python-docx, tqdm, numpy).", file=sys.stderr)
-    raise
+from embeddings_backends import make_backend
 
 # ---------------------------
 # Utilities
@@ -79,6 +74,7 @@ def normalize_text(s: str) -> str:
 class CacheKey:
     src_path: str
     mtime_ns: int
+    backend_kind: str
     model_name: str
     min_len: int
     max_length: int
@@ -88,6 +84,7 @@ class CacheKey:
             {
                 "src_path": self.src_path,
                 "mtime_ns": self.mtime_ns,
+                "backend": self.backend_kind,
                 "model": self.model_name,
                 "min_len": self.min_len,
                 "max_length": self.max_length,
@@ -96,33 +93,6 @@ class CacheKey:
         ).encode("utf-8")
         import hashlib
         return hashlib.sha1(blob).hexdigest()
-
-# ---------------------------
-# Embedding
-# ---------------------------
-
-def load_model(model_name: str, use_fp16: bool = True) -> BGEM3FlagModel:
-    return BGEM3FlagModel(model_name, use_fp16=use_fp16)
-
-
-def make_embeddings(
-    texts: List[str],
-    model: BGEM3FlagModel,
-    batch_size: int,
-    max_length: int,
-) -> np.ndarray:
-    embs = model.encode(
-        texts,
-        batch_size=batch_size,
-        max_length=max_length,
-        return_dense=True,
-        return_sparse=False,
-        return_colbert_vecs=False,
-    )["dense_vecs"]
-    embs = np.asarray(embs)
-    if embs.dtype != np.float32:
-        embs = embs.astype(np.float32, copy=False)
-    return embs
 
 # ---------------------------
 # Similarities
@@ -361,15 +331,22 @@ def choose_max_length(longest_char_len: int) -> int:
 
 def main(argv: Optional[Iterable[str]] = None) -> int:
     p = argparse.ArgumentParser(
-        description="Find similar paragraphs in a DOCX using BGE-M3 embeddings",
+        description="Find similar paragraphs in a DOCX using embeddings",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--input", required=True, help="Path to .docx file")
-    p.add_argument("--model", default="BAAI/bge-m3", help="Model name for FlagEmbedding")
+    p.add_argument("--backend", choices=["bge", "st"], default="bge")
+    p.add_argument("--model", default="BAAI/bge-m3", help="Embedding model name")
+    p.add_argument("--device", default="auto", help="Device for model (auto|cpu|cuda:0)")
+    p.add_argument("--no-fp16", action="store_true", help="Disable FP16 (BGE backend)")
+    p.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Allow remote code for sentence-transformers models",
+    )
     p.add_argument("--batch-size", type=int, default=32, help="Embedding batch size")
     p.add_argument("--min-len", type=int, default=25, help="Minimum paragraph length to keep")
     p.add_argument("--max-length", type=int, default=0, help="Override model max_length (0=auto)")
-    p.add_argument("--fp16", action="store_true", help="Use FP16 in model")
     p.add_argument("--threshold", type=float, default=0.88, help="Cosine similarity threshold")
     p.add_argument("--topk", type=int, default=5, help="Candidates per paragraph before thresholding")
     p.add_argument("--chunk-size", type=int, default=2048, help="Chunk size for similarity matmul")
@@ -378,7 +355,12 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     p.add_argument("--output", type=Path, default=Path("similar.txt"), help="Write human-readable TXT here")
     p.add_argument("--csv", type=Path, default=None, help="Optional CSV path for results")
     p.add_argument("--html", type=Path, default=None, help="Optional HTML report path")
-    p.add_argument("--cache-dir", type=Path, default=Path(".cache_bge"), help="Directory for embedding cache")
+    p.add_argument(
+        "--cache-dir",
+        type=Path,
+        default=Path(".cache_embeddings"),
+        help="Directory for embedding cache",
+    )
     p.add_argument("--dedupe", choices=["off", "exact", "normalized"], default="normalized", help="Collapse obvious duplicates before embedding")
 
     args = p.parse_args(list(argv) if argv is not None else None)
@@ -402,24 +384,61 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     key = CacheKey(
         src_path=str(src.resolve()),
         mtime_ns=int(src.stat().st_mtime_ns),
+        backend_kind=args.backend,
         model_name=args.model,
         min_len=args.min_len,
         max_length=max_len,
     )
     cache_dir: Path = args.cache_dir
     cache_dir.mkdir(parents=True, exist_ok=True)
-    emb_path = cache_dir / f"{key.digest()}.embeddings.npy"
+    base = cache_dir / key.digest()
+    emb_path = base.with_suffix(".embeddings.npy")
+    meta_path = base.with_suffix(".meta.json")
 
-    # Embeddings (with cache)
-    if emb_path.is_file():
-        embs = np.load(emb_path)
-        print(f"[cache] loaded embeddings {embs.shape} from {emb_path.name}")
-    else:
-        print(f"[model] loading {args.model} (fp16={args.fp16}) …")
-        model = load_model(args.model, use_fp16=args.fp16)
-        print(f"[embed] encoding {len(texts)} paragraphs (batch={args.batch_size}, max_length={max_len}) …")
-        embs = make_embeddings(texts, model, args.batch_size, max_len)
+    embs: Optional[np.ndarray] = None
+    if emb_path.is_file() and meta_path.is_file():
+        try:
+            meta = json.loads(meta_path.read_text())
+            if meta.get("backend") == args.backend and meta.get("model") == args.model:
+                embs = np.load(emb_path)
+                if (
+                    embs.shape == tuple(meta.get("shape", ()))
+                    and str(embs.dtype) == meta.get("dtype")
+                    and embs.shape[0] == len(texts)
+                ):
+                    print(
+                        f"[cache] loaded embeddings {embs.shape} from {emb_path.name}"
+                    )
+                else:
+                    embs = None
+        except Exception:
+            embs = None
+
+    if embs is None:
+        backend = make_backend(
+            kind=args.backend,
+            model_name=args.model,
+            device=args.device,
+            fp16=not args.no_fp16,
+            trust_remote_code=args.trust_remote_code,
+        )
+        print(
+            f"[embed] encoding {len(texts)} paragraphs (batch={args.batch_size}, max_length={max_len}) …"
+        )
+        embs = backend.encode(texts, batch_size=args.batch_size, max_length=max_len)
+        embs = np.asarray(embs, dtype=np.float32, order="C")
         np.save(emb_path, embs)
+        meta = {
+            "backend": args.backend,
+            "model": args.model,
+            "shape": list(embs.shape),
+            "dtype": str(embs.dtype),
+        }
+        meta_path.write_text(json.dumps(meta))
+
+    print(
+        f"[backend] backend={args.backend} model={args.model} device={args.device} dim={embs.shape[1]}"
+    )
 
     # Normalize & compute
     E = l2_normalize(embs.astype(np.float32, copy=False))

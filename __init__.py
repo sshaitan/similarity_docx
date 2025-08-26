@@ -20,7 +20,9 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext
 
 
-def _run_similarity(docx: Path, threshold: float, log: tk.Text) -> None:
+def _run_similarity(
+    docx: Path, threshold: float, backend: str, model: str, log: tk.Text
+) -> None:
     """Execute :mod:`main` for ``docx`` and append output to ``log``."""
     out_txt = docx.with_suffix(".txt")
     out_html = docx.with_suffix(".html")
@@ -31,6 +33,10 @@ def _run_similarity(docx: Path, threshold: float, log: tk.Text) -> None:
         str(docx),
         "--threshold",
         str(threshold),
+        "--backend",
+        backend,
+        "--model",
+        model,
         "--output",
         str(out_txt),
         "--html",
@@ -56,6 +62,8 @@ def main() -> None:
 
     file_var = tk.StringVar()
     thr_var = tk.DoubleVar(value=0.88)
+    backend_var = tk.StringVar(value="bge")
+    model_var = tk.StringVar(value="BAAI/bge-m3")
 
     def choose_file() -> None:
         fn = filedialog.askopenfilename(filetypes=[("Word", "*.docx")])
@@ -70,7 +78,13 @@ def main() -> None:
         log.delete("1.0", tk.END)
         th = threading.Thread(
             target=_run_similarity,
-            args=(path, float(thr_var.get()), log),
+            args=(
+                path,
+                float(thr_var.get()),
+                backend_var.get(),
+                model_var.get(),
+                log,
+            ),
             daemon=True,
         )
         th.start()
@@ -86,7 +100,15 @@ def main() -> None:
 
     tk.Label(frm, text="Порог схожести:").grid(row=1, column=0, sticky="w")
     tk.Entry(frm, textvariable=thr_var).grid(row=1, column=1, padx=5, sticky="we")
-    tk.Button(frm, text="Старт", command=start).grid(row=1, column=2)
+
+    tk.Label(frm, text="Бэкенд:").grid(row=2, column=0, sticky="w")
+    tk.OptionMenu(frm, backend_var, "bge", "st").grid(row=2, column=1, padx=5, sticky="we")
+
+    tk.Label(frm, text="Модель:").grid(row=3, column=0, sticky="w")
+    tk.Entry(frm, textvariable=model_var, width=50).grid(
+        row=3, column=1, padx=5, sticky="we"
+    )
+    tk.Button(frm, text="Старт", command=start).grid(row=3, column=2)
 
     log = scrolledtext.ScrolledText(root, width=80, height=20)
     log.pack(padx=10, pady=10, fill=tk.BOTH, expand=True)
