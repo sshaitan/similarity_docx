@@ -1,8 +1,10 @@
 # similarity_docx
 
 Инструмент для поиска похожих параграфов в документе Microsoft Word (`.docx`).
-Используются эмбеддинги модели [BGE‑M3](https://huggingface.co/BAAI/bge-m3)
-и косинусное сходство.
+По умолчанию используется модель [BGE‑M3](https://huggingface.co/BAAI/bge-m3),
+но через флаги `--backend` и `--model` можно выбрать любую модель из
+`FlagEmbedding` или `sentence-transformers` (например Jina v3, GTE-multilingual,
+Qwen-Embedding).
 
 ## Установка
 
@@ -18,8 +20,16 @@ pip install -r requirements.txt
 python main.py --input myfile.docx --html report.html
 ```
 
+Альтернатива с моделью из `sentence-transformers`:
+
+```bash
+python main.py --input myfile.docx --backend st --model jinaai/jina-embeddings-v3 --html report_jina.html
+```
+
 Полезные параметры:
 
+* `--backend` – бэкенд эмбеддингов (`bge` или `st`).
+* `--model` – название модели.
 * `--threshold` – минимальный порог схожести (по умолчанию `0.88`).
 * `--topk` – сколько кандидатов сравнивать для каждого параграфа (`5`).
 * `--dedupe` – режим удаления дубликатов перед эмбеддингом
