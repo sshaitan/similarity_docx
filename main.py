@@ -1,16 +1,26 @@
 #!/usr/bin/env python3
 """
-Find near-duplicate or highly similar paragraphs in a DOCX document.
+Similar paragraphs finder for .docx files (clean final version).
 
-Usage:
-  python main.py --input kk2.docx --threshold 0.9 --topk 5 --html report.html
+Features
+- Batched embeddings (FlagEmbedding BGE-M3 by default)
+- Optional pre-embedding de-duplication: off / exact / normalized
+- Length-based masking for candidate pairs (min ratio and/or max abs diff)
+- Chunked cosine similarities with unique (i<j) pairs
+- TXT / CSV / HTML report (with simple inline highlight of common spans)
+- Embedding cache on disk per (file, mtime, model, min_len, max_length)
 
-Key features:
-- Pre-embedding de-duplication with configurable modes (off / exact / normalized)
-- Simple HTML report with inline similarity coloring and diff-like highlighting
-- Batched embeddings, caching and chunked cosine for speed
+Install deps:
+  pip install python-docx FlagEmbedding numpy tqdm
 
-Dependencies: python-docx, FlagEmbedding, numpy, tqdm
+Usage examples:
+  python similar_paragraphs_final.py \
+    --input kk2.docx --threshold 0.9 --topk 5 --html report.html
+
+  # normalized de-duplication and length mask
+  python similar_paragraphs_final.py \
+    --input kk2.docx --dedupe normalized \
+    --len-ratio-min 0.7 --len-diff-max 300 --csv pairs.csv
 """
 from __future__ import annotations
 
@@ -52,13 +62,11 @@ _whitespace_re = re.compile(r"\s+", re.UNICODE)
 
 
 def normalize_text(s: str) -> str:
-    """Lenient normalization for duplicate collapsing.
-    - lowercase
-    - collapse whitespace
-    - strip punctuation/symbols
+    """Lenient normalization used to collapse duplicates.
+    - lowercase, remove punctuation/symbols, collapse whitespace
     """
     try:
-        import regex as _regex  # better \p{P} / \p{S}
+        import regex as _regex  # supports \p{P} / \p{S}
         punct = _regex.sub(r"[\p{P}\p{S}]", " ", s)
     except Exception:
         punct = re.sub(r"[\W_]", " ", s, flags=re.UNICODE)
@@ -131,15 +139,46 @@ def topk_similarities(
     topk: int,
     threshold: float,
     chunk_size: int = 2048,
+    lengths: Optional[np.ndarray] = None,
+    len_ratio_min: float = 0.6,
+    len_diff_max: int = 0,
 ) -> List[Tuple[int, int, float]]:
+    """Return unique (i, j, sim) with i < j.
+
+    Length mask:
+      - ratio:  min(len_i, len_j) / max(len_i, len_j) >= len_ratio_min
+      - diff:   |len_i - len_j| <= len_diff_max   (0 disables)
+    """
     N = E.shape[0]
+    if lengths is None:
+        lengths = np.ones(N, dtype=np.int32)
+    else:
+        lengths = lengths.astype(np.int32, copy=False)
+
     results: List[Tuple[int, int, float]] = []
     for start in tqdm(range(0, N, chunk_size), desc="similarity", unit="chunk"):
         stop = min(start + chunk_size, N)
         S = E[start:stop] @ E.T  # (chunk, N)
+
+        # Build length mask for this chunk vs all
+        la = lengths[start:stop].astype(np.float32)[:, None]
+        lb = lengths.astype(np.float32)[None, :]
+        minlen = np.minimum(la, lb)
+        maxlen = np.maximum(la, lb)
+        ratio_mask = (minlen / np.maximum(maxlen, 1.0)) >= float(len_ratio_min)
+        if len_diff_max and len_diff_max > 0:
+            diff_mask = (np.abs(la - lb) <= int(len_diff_max))
+            mask = ratio_mask & diff_mask
+        else:
+            mask = ratio_mask
+
+        # mask out invalid comps and self-sim
+        S[~mask] = -1.0
         rows = stop - start
         for r in range(rows):
             S[r, start + r] = -1.0
+
+        # top-k per row
         if topk > 0 and topk < N:
             idx = np.argpartition(S, -topk, axis=1)[:, -topk:]
         else:
@@ -153,7 +192,9 @@ def topk_similarities(
                     a, b = (i_abs, int(j)) if i_abs < j else (int(j), i_abs)
                     if a != b:
                         results.append((a, b, float(s)))
-    dedup = {}
+
+    # dedup pairs, keep max score
+    dedup: Dict[Tuple[int, int], float] = {}
     for a, b, s in results:
         key = (a, b)
         if key not in dedup or s > dedup[key]:
@@ -163,18 +204,14 @@ def topk_similarities(
     return out
 
 # ---------------------------
-# Dedupe
+# De-duplication
 # ---------------------------
 
 def dedupe_texts(texts: List[str], mode: str) -> Tuple[List[str], Dict[int, int], Dict[int, List[int]]]:
     """
-    Returns:
-      kept_texts, old_to_new_idx, groups
-    where groups[new_idx] = list of original indices collapsed into it (including the representative).
-    Modes:
-      - 'off': no dedupe
-      - 'exact': collapse exact string duplicates
-      - 'normalized': collapse by normalize_text(s)
+    Returns (kept_texts, old_to_new_idx, groups)
+    groups[new_idx] = list of original indices collapsed into it (incl. representative).
+    Modes: 'off' | 'exact' | 'normalized'
     """
     if mode == "off":
         return texts, {i: i for i in range(len(texts))}, {i: [i] for i in range(len(texts))}
@@ -206,7 +243,7 @@ def write_txt(
     pairs: List[Tuple[int, int, float]],
     texts: List[str],
     path: Optional[Path],
-):
+) -> str:
     lines: List[str] = []
     for i, j, s in pairs:
         lines.append(
@@ -228,7 +265,7 @@ def write_csv(
     pairs: List[Tuple[int, int, float]],
     texts: List[str],
     path: Path,
-):
+) -> None:
     import csv
     with path.open("w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
@@ -247,8 +284,8 @@ def _highlight_common(a: str, b: str) -> Tuple[str, str]:
     """
     import difflib
     sm = difflib.SequenceMatcher(a=a, b=b)
-    a_out = []
-    b_out = []
+    a_out: List[str] = []
+    b_out: List[str] = []
     for tag, i1, i2, j1, j2 in sm.get_opcodes():
         a_seg = _escape_html(a[i1:i2])
         b_seg = _escape_html(b[j1:j2])
@@ -266,13 +303,13 @@ def write_html(
     texts: List[str],
     path: Path,
     dedupe_groups: Optional[Dict[int, List[int]]] = None,
-):
+) -> None:
     def color_for_score(s: float) -> str:
         # 0.0 -> light gray, 1.0 -> deeper green
         g = int(240 - min(max((s - 0.7) / 0.3, 0.0), 1.0) * 160)  # focus 0.7..1.0
         return f"rgb(200,{g},200)"
 
-    rows = []
+    rows: List[str] = []
     for i, j, s in pairs:
         a_html, b_html = _highlight_common(texts[i], texts[j])
         dedupe_info_a = f"<div class='small'>Collapsed originals: {dedupe_groups.get(i, [i])}</div>" if dedupe_groups else ""
@@ -336,6 +373,8 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     p.add_argument("--threshold", type=float, default=0.88, help="Cosine similarity threshold")
     p.add_argument("--topk", type=int, default=5, help="Candidates per paragraph before thresholding")
     p.add_argument("--chunk-size", type=int, default=2048, help="Chunk size for similarity matmul")
+    p.add_argument("--len-ratio-min", type=float, default=0.6, help="Skip pairs where shorter/longer < this ratio (0..1)")
+    p.add_argument("--len-diff-max", type=int, default=0, help="Skip pairs whose abs length difference exceeds this many characters; 0=disabled")
     p.add_argument("--output", type=Path, default=Path("similar.txt"), help="Write human-readable TXT here")
     p.add_argument("--csv", type=Path, default=None, help="Optional CSV path for results")
     p.add_argument("--html", type=Path, default=None, help="Optional HTML report path")
@@ -355,9 +394,11 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     if args.dedupe != "off":
         print(f"[dedupe] {len(texts_raw)} -> {len(texts)} unique (mode={args.dedupe})")
 
+    # Choose max length
     longest = max(len(t) for t in texts)
     max_len = args.max_length if args.max_length > 0 else choose_max_length(longest)
 
+    # Cache key and path
     key = CacheKey(
         src_path=str(src.resolve()),
         mtime_ns=int(src.stat().st_mtime_ns),
@@ -365,12 +406,11 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         min_len=args.min_len,
         max_length=max_len,
     )
-
-    # Cache
     cache_dir: Path = args.cache_dir
     cache_dir.mkdir(parents=True, exist_ok=True)
-
     emb_path = cache_dir / f"{key.digest()}.embeddings.npy"
+
+    # Embeddings (with cache)
     if emb_path.is_file():
         embs = np.load(emb_path)
         print(f"[cache] loaded embeddings {embs.shape} from {emb_path.name}")
@@ -378,14 +418,27 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         print(f"[model] loading {args.model} (fp16={args.fp16}) …")
         model = load_model(args.model, use_fp16=args.fp16)
         print(f"[embed] encoding {len(texts)} paragraphs (batch={args.batch_size}, max_length={max_len}) …")
-        embs = make_embeddings(texts, model, args.batch_size, max_length=max_len)
+        embs = make_embeddings(texts, model, args.batch_size, max_len)
         np.save(emb_path, embs)
 
+    # Normalize & compute
     E = l2_normalize(embs.astype(np.float32, copy=False))
+    lengths = np.array([len(t) for t in texts], dtype=np.int32)
+    print(
+        f"[sim] computing similarities (topk={args.topk}, thr={args.threshold}, chunk={args.chunk_size}, "
+        f"len_ratio_min={args.len_ratio_min}, len_diff_max={args.len_diff_max}) …"
+    )
+    pairs = topk_similarities(
+        E,
+        topk=args.topk,
+        threshold=args.threshold,
+        chunk_size=args.chunk_size,
+        lengths=lengths,
+        len_ratio_min=args.len_ratio_min,
+        len_diff_max=args.len_diff_max,
+    )
 
-    print(f"[sim] computing similarities (topk={args.topk}, thr={args.threshold}, chunk={args.chunk_size}) …")
-    pairs = topk_similarities(E, topk=args.topk, threshold=args.threshold, chunk_size=args.chunk_size)
-
+    # Output
     print(f"[out] {len(pairs)} pairs ≥ {args.threshold}")
     if args.output:
         write_txt(pairs, texts, args.output)
